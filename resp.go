@@ -168,11 +168,16 @@ func (r *Resp) readBulk() (Value, error) {
 	}
 
 	bulk := make([]byte, len)
-	r.reader.Read(bulk)
+	// Read fills at most one buffer; ReadFull loops until the slice is full.
+	if _, err := io.ReadFull(r.reader, bulk); err != nil {
+		return v, err
+	}
 	v.bulk = string(bulk)
 
 	// consume \r\n
-	r.readLine()
+	if _, _, err := r.readLine(); err != nil {
+		return v, err
+	}
 
 	return v, nil
 }
@@ -190,8 +195,7 @@ func (r *Resp) Read() (Value, error) {
 	case BULK:
 		return r.readBulk()
 	default:
-		fmt.Printf("Unknown type: %v", string(_type))
-		return Value{}, nil
+		return Value{}, fmt.Errorf("unknown RESP type: %v", string(_type))
 	}
 }
 

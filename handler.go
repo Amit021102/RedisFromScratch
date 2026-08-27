@@ -110,7 +110,8 @@ func hgetall(args []Value) Value {
 	HSETsMu.RUnlock()
 
 	if !ok {
-		return Value{typ: "null"}
+		// real Redis answers an unknown hash with an empty array, not nil
+		return Value{typ: "array", array: []Value{}}
 	}
 
 	var arr []Value

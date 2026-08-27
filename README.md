@@ -1,32 +1,31 @@
 # Redis From Scratch
 
-A minimal Redis server written in Go from scratch — no libraries, just `net` and the standard library.
+A minimal Redis server written in Go from scratch — no libraries, just the standard library.
 
 ## Main idea
 
 Redis speaks a simple text protocol (RESP) over TCP. This repo implements enough of it to be a real
-Redis server: accept a TCP connection, parse RESP commands, run them against in-memory maps, and
-serialize the reply back as RESP. Any standard client (`redis-cli`) can talk to it.
+Redis server: accept a TCP connection, parse RESP commands, run them against in-memory maps, append
+every write to a log on disk, and serialize the reply back as RESP. Any standard client
+(`redis-cli`) can talk to it.
 
 The code is deliberately split by concern:
 
 | File | Responsibility |
 | --- | --- |
-| `main.go` | TCP listener and the read → dispatch → write loop |
+| `main.go` | TCP listener, AOF replay on boot, and the read → dispatch → write loop |
 | `resp.go` | RESP protocol: `Value` type, reader (deserialize) and writer (`Marshal`) |
 | `handler.go` | Command implementations and the `Handlers` command table |
-| `aof.go` | Placeholder for append-only-file persistence (not implemented yet) |
+| `aof.go` | Append-only file: durable log of every write, replayed at startup |
 
 ## How to run
 
-There is no `go.mod` committed yet, so initialize the module once:
-
 ```bash
-go mod init redisfromscratch   # first time only
 go run .
 ```
 
-The server listens on `:6379`. Connect with the standard client:
+The server listens on `:6379` and keeps its state in `database.aof` in the working directory.
+Connect with the standard client:
 
 ```bash
 redis-cli -p 6379
@@ -57,7 +56,8 @@ PING              # -> PONG
 PING hello        # -> "hello"
 ```
 
-Everything lives in memory and is lost on restart.
+Restart the server and the data is still there — `SET` and `HSET` are replayed from `database.aof`
+at boot.
 
 ## Choices
 
@@ -67,10 +67,28 @@ Everything lives in memory and is lost on restart.
 - **Command table over a switch.** `Handlers` maps an uppercased command name to a
   `func([]Value) Value`. Adding a command is one map entry and one function; `main.go` never changes.
 - **Two stores, two locks.** `SETs` and `HSETs` each get their own `sync.RWMutex` — reads take
-  `RLock` so concurrent `GET`s don't block each other. The locks are already correct for the
-  multi-client server the next step brings.
-- **One client at a time.** `l.Accept()` is called once, outside the loop, so the server handles a
-  single connection and exits when it closes. Deliberate for now: it keeps the request loop flat and
-  easy to read. The fix is a `for { conn, _ := l.Accept(); go handle(conn) }`.
-- **Persistence deferred.** `aof.go` is a stub. The plan is an append-only file: log every write
-  command as RESP and replay it on boot — which the existing `Resp` reader already knows how to parse.
+  `RLock` so concurrent `GET`s don't block each other.
+- **AOF, not snapshots.** Persistence is a log of the commands themselves, written as RESP. That
+  means the replay path is the same parser the network path uses: `NewResp(file)` in a loop, feeding
+  each command back through `Handlers`. No separate serialization format to maintain.
+- **`fsync` once per second.** `file.Write` only reaches the OS page cache; a background goroutine
+  calls `Sync()` every second to force it to the physical disk. A process crash loses nothing, and a
+  power cut loses at most a second of writes — the same trade-off real Redis calls
+  `appendfsync everysec`.
+- **Only successful writes are logged.** A command is appended to the AOF after its handler runs and
+  only if it didn't return an error, so a rejected command can't come back to life on the next boot.
+- **A goroutine per connection.** `main` loops on `Accept` and hands each client to `handleConn`,
+  which owns one `Resp` reader and one `Writer` for the life of that connection. Reusing the reader
+  matters: a fresh `bufio.Reader` per command would discard bytes it had already buffered, silently
+  dropping pipelined commands.
+- **Apply and log under one lock.** `applyMu` wraps "run the handler, then append to the AOF" for
+  write commands. The per-store `RWMutex`es already make each map access safe on its own, but without
+  this the two steps could interleave between goroutines and leave the log in a different order than
+  the writes were applied — so a replay would rebuild different data than the server held. Reads
+  never take it and stay fully parallel.
+
+
+## Source
+
+  The idea behind the projects and most of the code comes from https://www.build-redis-from-scratch.dev/en/introduction
+  

@@ -1,0 +1,6 @@
+# runtime state
+database.aof
+
+# build output
+redisfromscratch
+*.exe
